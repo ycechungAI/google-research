@@ -1,4 +1,4 @@
-torch==1.13.1
+torch==2.13.0
 numpy==1.23.5
 absl-py==1.2.0
 pip==26.0
