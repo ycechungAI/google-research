@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 from absl import logging
 import ml_collections
+import peft
 import torch
 from torch import nn
 import transformers
@@ -28,6 +29,11 @@ import transformers
 from Uboreshaji_Modeli.common import audio_utils
 from . import base
 from . import decoders
+
+_DEFAULT_SYSTEM_PROMPT = (
+    "You are an assistant that transcribes speech accurately."
+)
+_DEFAULT_USER_PROMPT = "Please transcribe this audio."
 
 
 def _mask_labels(labels, processor):
@@ -86,20 +92,17 @@ def _collate_fn(
   audios = [example["audio"]["array"] for example in examples]
 
   device_type = cfg.training.get("device", "cuda") if cfg else "cuda"
+  # Transformers v5 processors reject a top-level `max_length`.
   if device_type == "tpu":
-    padding = "max_length"
     max_length = cfg.get("max_seq_length", 512) if cfg else 512
+    kwargs = {
+        "padding": "max_length",
+        "text_kwargs": {"max_length": max_length},
+    }
   else:
-    padding = True
-    max_length = None
+    kwargs = {"padding": True}
 
-  batch = processor(
-      text=texts,
-      audio=audios,
-      return_tensors="pt",
-      padding=padding,
-      max_length=max_length,
-  )
+  batch = processor(text=texts, audio=audios, return_tensors="pt", **kwargs)
   # Detach and clone to avoid issues with in-place operations
   batch = {
       k: v.detach().clone() if isinstance(v, torch.Tensor) else v
@@ -117,9 +120,11 @@ class GemmaAudioTransform:
       self,
       prompt,
       cfg,
+      system_prompt = _DEFAULT_SYSTEM_PROMPT,
   ):
     self.prompt = prompt
     self.cfg = cfg
+    self.system_prompt = system_prompt
 
   def __call__(
       self,
@@ -171,10 +176,14 @@ class GemmaAudioTransform:
       assistant_content = [
           {"type": "text", "text": text if text else ""},
       ]
-      messages_list.append([
+      messages = []
+      if self.system_prompt:
+        messages.append({"role": "system", "content": self.system_prompt})
+      messages.extend([
           {"role": "user", "content": user_content},
           {"role": "assistant", "content": assistant_content},
       ])
+      messages_list.append(messages)
 
     return {"messages": messages_list, "audio": audio_list}
 
@@ -192,15 +201,17 @@ class GemmaAudioPreprocessor(base.DataPreprocessor):
   ):
     """Returns a transform function for Gemma audio models."""
     del self, processor  # Unused; processor is used at collation time.
-    prompt = (
-        cfg.prompt
-        if cfg and "prompt" in cfg
-        else "Transpose the following audio:"
+    prompt = cfg.prompt if cfg and "prompt" in cfg else _DEFAULT_USER_PROMPT
+    system_prompt = (
+        cfg.system_prompt
+        if cfg and "system_prompt" in cfg
+        else _DEFAULT_SYSTEM_PROMPT
     )
 
     return GemmaAudioTransform(
         prompt=prompt,
         cfg=cfg,
+        system_prompt=system_prompt,
     )
 
   def get_collate_fn(
@@ -277,8 +288,25 @@ class GemmaAudioEngine(base.ModelEngine):
       AutoModelForCausalLM model on the device, and processor is the
       AutoProcessor instance.
     """
-    del self, kwargs  # Unused.
+    del self  # Unused.
+    cfg = kwargs.get("cfg")
     processor = transformers.AutoProcessor.from_pretrained(model_id)
-    model = transformers.AutoModelForMultimodalLM.from_pretrained(model_id)
+    processor.tokenizer.padding_side = "right"
+    # Gemma 3n trains with eager attention.
+    model = transformers.AutoModelForMultimodalLM.from_pretrained(
+        model_id, attn_implementation="eager"
+    )
+    if cfg and cfg.training.get("use_lora", False):
+      lora = cfg.training.lora
+      model = peft.get_peft_model(
+          model,
+          peft.LoraConfig(
+              task_type="CAUSAL_LM",
+              r=lora.r,
+              lora_alpha=lora.alpha,
+              lora_dropout=lora.dropout,
+              target_modules=list(lora.target_modules),
+          ),
+      )
     model.to(device)
     return model, processor

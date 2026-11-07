@@ -13,7 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration for MMS ASR fine-tuning."""
+"""Reference template configuration for MMS CTC ASR fine-tuning.
+
+Illustrates how to wire the `MMS` engine (`TaskType.CTC_ASR`). Pass
+`--dataset_path` and adapt hyperparameters and the per-language CTC vocabulary
+for your target dataset.
+"""
 
 import ml_collections
 from Uboreshaji_Modeli.common import config
@@ -49,4 +54,5 @@ def get_config():
   cfg.training.freeze_feature_extractor = True
   cfg.training.freeze_base_model = False
 
+  config_utils.derive_paths(cfg)
   return cfg

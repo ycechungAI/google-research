@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration for Whisper ASR fine-tuning."""
+"""Reference template configuration for Whisper ASR fine-tuning.
+
+Illustrates how to wire the `WHISPER` engine (`TaskType.ASR`). Pass
+`--dataset_path` and adapt hyperparameters for your target dataset.
+"""
 
 import ml_collections
 from Uboreshaji_Modeli.common import config
@@ -45,4 +49,5 @@ def get_config():
   cfg.training.learning_rate = 1e-5
   cfg.training.audio_sample_rate = 16000
 
+  config_utils.derive_paths(cfg)
   return cfg

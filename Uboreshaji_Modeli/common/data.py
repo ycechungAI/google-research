@@ -26,6 +26,8 @@ from etils import epath
 import ml_collections
 from PIL import Image
 
+from Uboreshaji_Modeli.common import bagz_data
+
 
 class PicklableProcessorMixin:
   """Mixin to make Transforms with unpicklable processors picklable.
@@ -321,6 +323,8 @@ class DataCollatorCTCWithPadding:
 
 def get_dataset(cfg):
   """Loads and prepares the dataset."""
+  if cfg.dataset.get("format") == "bagz":
+    return bagz_data.split_source(cfg, cfg.dataset.train_split)
   import os  # pylint: disable=g-import-not-at-top
   dataset_path = cfg.dataset.dataset_path
 

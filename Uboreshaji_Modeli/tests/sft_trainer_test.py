@@ -23,9 +23,11 @@ import ml_collections
 import torch
 import trl
 
+from Uboreshaji_Modeli.common import config
+from Uboreshaji_Modeli.common import sft_trainer
 from Uboreshaji_Modeli.engines import base as engines_base
-from Uboreshaji_Modeli.google.common import sft_trainer
-from Uboreshaji_Modeli.google.trainers import sft
+from Uboreshaji_Modeli.trainers import factory as trainers_factory
+from Uboreshaji_Modeli.trainers import sft
 
 
 class FakeCriterion(torch.nn.Module):
@@ -40,6 +42,7 @@ class FakeModelEngine(engines_base.ModelEngine):
     return torch.nn.Module(), object()
 
   def get_transform_fn(self, *args, **kwargs):
+    self.transform_kwargs = kwargs
     return lambda x: x
 
   def get_collate_fn(self, *args, **kwargs):
@@ -174,7 +177,14 @@ class GemmaSFTTrainerStrategyTest(parameterized.TestCase):
     captured_kwargs = mock_sft_config_class.call_args.kwargs
     self.assertEqual(captured_kwargs.get("bf16"), expected_bf16)
     self.assertEqual(captured_kwargs.get("fp16"), expected_fp16)
-    mock_trainer_instance.train.assert_called_once()
+    mock_trainer_instance.train.assert_called_once_with(
+        resume_from_checkpoint=False
+    )
+    self.assertTrue(mock_engine.transform_kwargs["is_train"])
+    self.assertIs(
+        mock_custom_sft_trainer_class.call_args.kwargs["train_dataset"],
+        mock_dataset["train"],
+    )
 
   def test_tpu_device_raises_error_on_fp16(self):
     trainer_strategy = sft.GemmaSFTTrainerStrategy()
@@ -205,64 +215,95 @@ class GemmaSFTTrainerStrategyTest(parameterized.TestCase):
           output_path=mock_output_path,
       )
 
+  def test_bagz_eval_uses_unwrapped_eval_stream(self):
+    cfg = self._make_config()
+    cfg.dataset.update(
+        format="bagz", eval_split="validation", eval_num_records=8
+    )
+    cfg.training.eval_steps = 5
+    cfg.eval = {"eval_batch_size": 2}
+    self.enter_context(
+        unittest.mock.patch.object(
+            sft.bagz_data, "split_source", return_value=[b""] * 8
+        )
+    )
+    mock_config = self.enter_context(
+        unittest.mock.patch.object(trl, "SFTConfig", autospec=True)
+    )
+    mock_trainer = self.enter_context(
+        unittest.mock.patch.object(
+            sft_trainer, "CustomSFTTrainer", autospec=True
+        )
+    )
+
+    sft.GemmaSFTTrainerStrategy().train(
+        engine=FakeModelEngine(),
+        dataset=[b""] * 8,
+        cfg=cfg,
+        device=MockCpuDevice(),
+        model=torch.nn.Module(),
+        processor=object(),
+        output_path="/tmp/dummy_output",
+    )
+
+    self.assertEqual(mock_config.call_args.kwargs["eval_strategy"], "steps")
+    self.assertEqual(mock_config.call_args.kwargs["eval_steps"], 5)
+    eval_dataset = mock_trainer.call_args.kwargs["eval_dataset"]
+    self.assertIsNotNone(eval_dataset)
+    self.assertIs(
+        mock_trainer.return_value.get_eval_dataloader(), eval_dataset
+    )
+
 
 class CustomSFTTrainerTest(absltest.TestCase):
 
-  def test_tpu_monkey_patch(self):
-    from accelerate.utils import operations  # pylint: disable=g-import-not-at-top
-    import accelerate.accelerator as acc_mod  # pylint: disable=g-import-not-at-top
+  def test_patch_hf_quantizer_delegates_from_base_model(self):
+    base_model = torch.nn.Module()
+    sentinel_quantizer = object()
+    base_model.hf_quantizer = sentinel_quantizer
 
-    original_operations_gather = operations.gather
-    original_acc_mod_gather = getattr(acc_mod, "gather", None)
+    class FakePeftModel(torch.nn.Module):
 
-    # Mock dist
+      def get_base_model(self):
+        return base_model
+
+    peft_model = FakePeftModel()
+    with unittest.mock.patch("trl.SFTTrainer.__init__", return_value=None):
+      trainer = sft_trainer.CustomSFTTrainer(model=peft_model)
+
+    self.assertIs(peft_model.hf_quantizer, sentinel_quantizer)
+    self.assertIsNone(trainer.create_model_card())
+
+
+
+class TrainerFactoryTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      ("asr", config.TaskType.ASR),
+      ("ctc_asr", config.TaskType.CTC_ASR),
+  )
+  def test_get_sft_trainer_strategy(self, task_type):
+    strategy = trainers_factory.get_trainer(task_type)
+    self.assertIsInstance(strategy, sft.GemmaSFTTrainerStrategy)
+
+
+class OnRank0Test(absltest.TestCase):
+
+  def test_other_ranks_receive_broadcast_result(self):
+    dist = sft.dist
     self.enter_context(
-        unittest.mock.patch(
-            "torch.distributed.is_initialized", return_value=True
-        )
+        unittest.mock.patch.object(dist, "is_initialized", return_value=True)
     )
     self.enter_context(
-        unittest.mock.patch(
-            "torch.distributed.get_backend", return_value="tpu_dist"
-        )
+        unittest.mock.patch.object(dist, "get_rank", return_value=1)
     )
-    self.enter_context(
-        unittest.mock.patch("torch.distributed.get_world_size", return_value=2)
+    broadcast = self.enter_context(
+        unittest.mock.patch.object(dist, "broadcast_object_list")
     )
-    mock_all_gather = self.enter_context(
-        unittest.mock.patch("torch.distributed.all_gather")
-    )
-
-    try:
-      model = torch.nn.Module()
-
-      with unittest.mock.patch("trl.SFTTrainer.__init__", return_value=None):
-        _ = sft_trainer.CustomSFTTrainer(
-            model=model,
-        )
-
-      # Verify patched
-      self.assertNotEqual(operations.gather, original_operations_gather)
-
-      # Test standard patched function
-      tensor = torch.tensor([1, 2])
-      def fake_all_gather(output_tensors, t):
-        output_tensors[0] = t.clone()
-        output_tensors[1] = t.clone() * 2
-
-      mock_all_gather.side_effect = fake_all_gather
-
-      result = operations.gather(tensor)
-
-      # Verify result
-      expected = torch.tensor([1, 2, 2, 4])
-      torch.testing.assert_close(result, expected)
-
-    finally:
-      # Restore
-      operations.gather = original_operations_gather
-      if original_acc_mod_gather is not None:
-        acc_mod.gather = original_acc_mod_gather
+    fn = unittest.mock.Mock()
+    sft._on_rank0(fn)
+    fn.assert_not_called()
+    broadcast.assert_called_once_with([None], src=0)
 
 
 if __name__ == "__main__":

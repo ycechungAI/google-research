@@ -76,6 +76,23 @@ class GetBaseConfigTest(parameterized.TestCase):
     self.assertFalse(hasattr(cfg, "matcher"))
     self.assertFalse(hasattr(cfg, "detection"))
 
+  def test_get_asr_base_config(self):
+    cfg = config.get_asr_base_config()
+    with self.subTest(name="test_task_modality"):
+      self.assertEqual(cfg.task_modality, config.TaskModality.AUDIO)
+    with self.subTest(name="test_load_from_hub"):
+      self.assertTrue(cfg.dataset.load_from_hub)
+
+  def test_get_text_sft_base_config(self):
+    cfg = config.get_text_sft_base_config()
+    with self.subTest(name="test_task_modality"):
+      self.assertEqual(cfg.task_modality, config.TaskModality.TEXT)
+    with self.subTest(name="test_load_from_hub"):
+      self.assertTrue(cfg.dataset.load_from_hub)
+    with self.subTest(name="test_use_lora"):
+      self.assertTrue(cfg.training.use_lora)
+    with self.subTest(name="test_merge_lora_on_save"):
+      self.assertFalse(cfg.training.merge_lora_on_save)
 
 
 class DerivePathsTest(absltest.TestCase):
@@ -144,6 +161,43 @@ class DerivePathsTest(absltest.TestCase):
         cfg.dataset.dataset_path, "/custom/base/ds/huggingface_dataset/v1/"
     )
     self.assertEqual(cfg.model_id, "/custom/mbase/mname")
+
+
+class PublicConfigsDerivePathsTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      ("gemma_asr_lora", "configs/gemma_asr_lora_config.py"),
+      ("gemma_audio", "configs/gemma_audio_config.py"),
+      ("mms_asr", "configs/mms_asr_config.py"),
+      ("whisper_asr", "configs/whisper_asr_config.py"),
+  )
+  def test_public_asr_configs_populate_dataset_path(self, rel_config_path):
+    import pathlib  # pylint: disable=g-import-not-at-top
+
+    pkg_dir = pathlib.Path(__file__).parent.parent
+    cfg = config_utils.load_config(str(pkg_dir / rel_config_path))
+    self.assertNotEmpty(cfg.dataset.dataset_path)
+    self.assertNotEmpty(cfg.model_id)
+
+  def test_gemma_asr_lora_config_derives_language_subdir(self):
+    import pathlib  # pylint: disable=g-import-not-at-top
+
+    pkg_dir = pathlib.Path(__file__).parent.parent
+    cfg = config_utils.load_config(
+        str(pkg_dir / "configs/gemma_asr_lora_config.py")
+    )
+    self.assertTrue(cfg.dataset.dataset_path.endswith("/aka"))
+
+  def test_gemma_asr_lora_config_effective_batch_size(self):
+    import pathlib  # pylint: disable=g-import-not-at-top
+
+    pkg_dir = pathlib.Path(__file__).parent.parent
+    cfg = config_utils.load_config(
+        str(pkg_dir / "configs/gemma_asr_lora_config.py")
+    )
+    self.assertEqual(cfg.training.batch_size, 4)
+    self.assertEqual(cfg.training.gradient_accumulation_steps, 4)
+
 
 if __name__ == "__main__":
   absltest.main()
